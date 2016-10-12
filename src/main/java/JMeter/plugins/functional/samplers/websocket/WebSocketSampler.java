@@ -4,11 +4,12 @@
  */
 package JMeter.plugins.functional.samplers.websocket;
 
-import java.io.IOException;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.config.Argument;
 import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.protocol.http.control.Header;
+import org.apache.jmeter.protocol.http.control.HeaderManager;
 import org.apache.jmeter.protocol.http.util.EncoderCache;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
 import org.apache.jmeter.protocol.http.util.HTTPConstants;
@@ -16,12 +17,18 @@ import org.apache.jmeter.samplers.AbstractSampler;
 import org.apache.jmeter.samplers.Entry;
 import org.apache.jmeter.samplers.SampleResult;
 import org.apache.jmeter.testelement.TestElement;
-import org.apache.jmeter.testelement.property.*;
+import org.apache.jmeter.testelement.TestStateListener;
+import org.apache.jmeter.testelement.property.PropertyIterator;
+import org.apache.jmeter.testelement.property.StringProperty;
+import org.apache.jmeter.testelement.property.TestElementProperty;
 import org.apache.jorphan.logging.LoggingManager;
 import org.apache.jorphan.util.JOrphanUtils;
 import org.apache.log.Logger;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
+import org.eclipse.jetty.websocket.client.WebSocketClient;
 
-
+import java.io.IOException;
 
 
 import java.io.UnsupportedEncodingException;
@@ -33,10 +40,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.jmeter.testelement.TestStateListener;
-import org.eclipse.jetty.util.ssl.SslContextFactory;
-import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
-import org.eclipse.jetty.websocket.client.WebSocketClient;
 
 /**
  *
@@ -54,11 +57,13 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     private static final String WS_PREFIX = "ws://"; // $NON-NLS-1$
     private static final String WSS_PREFIX = "wss://"; // $NON-NLS-1$
     private static final String DEFAULT_PROTOCOL = "ws";
+
+    private HeaderManager headerManager;
     
     private static Map<String, ServiceSocket> connectionList;
     
-    private static ExecutorService executor = Executors.newCachedThreadPool(); 
-
+    private static ExecutorService executor;
+    
     public WebSocketSampler() {
         super();
         setName("WebSocket sampler");
@@ -70,14 +75,20 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         String connectionId = getThreadName() + getConnectionId();
         
         if (isStreamingConnection() && connectionList.containsKey(connectionId)) {
-        	ServiceSocket socket = connectionList.get(connectionId);
-            socket.initialize();
-            return socket;
+            ServiceSocket socket = connectionList.get(connectionId);
+            if (!isResetStreamingConnection()) {
+                socket.initialize();
+                return socket;
+            } else {
+                connectionList.remove(connectionId);
+                socket.close();
+            }
         }
         
         //Create WebSocket client
         SslContextFactory sslContexFactory = new SslContextFactory();
         sslContexFactory.setTrustAll(isIgnoreSslErrors());
+//        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
         WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
         
         ServiceSocket socket = new ServiceSocket(this, webSocketClient);
@@ -88,6 +99,13 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         //Start WebSocket client thread and upgrage HTTP connection
         webSocketClient.start();
         ClientUpgradeRequest request = new ClientUpgradeRequest();
+        if (headerManager != null) {
+            for (int i = 0; i < headerManager.size(); i++) {
+                Header header = headerManager.get(i);
+                request.setHeader(header.getName(), header.getValue());
+            }
+        }
+
         webSocketClient.connect(socket, uri, request);
         
         //Get connection timeout or use the default value
@@ -354,9 +372,17 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     public void setStreamingConnection(Boolean streamingConnection) {
             setProperty("streamingConnection", streamingConnection);
     }
-
+    
     public Boolean isStreamingConnection() {
             return getPropertyAsBoolean("streamingConnection");
+    }
+    
+    public void setResetStreamingConnection(Boolean resetStreamingConnection) {
+        setProperty("resetStreamingConnection", resetStreamingConnection);
+    }
+    
+    public Boolean isResetStreamingConnection() {
+        return getPropertyAsBoolean("resetStreamingConnection");
     }
 
     public void setConnectionId(String connectionId) {
@@ -477,6 +503,13 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         return args;
     }
 
+    public void addTestElement(TestElement el) {
+        if (el instanceof HeaderManager) {
+            headerManager = (HeaderManager) el;
+        } else {
+            super.addTestElement(el);
+        }
+    }
 
     @Override
     public void testStarted() {
@@ -486,6 +519,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     @Override
     public void testStarted(String host) {
         connectionList = new ConcurrentHashMap<String, ServiceSocket>();
+        executor = Executors.newCachedThreadPool();
     }
 
     @Override
@@ -498,6 +532,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         for (ServiceSocket socket : connectionList.values()) {
             socket.close();
         }
+        executor.shutdown();
     }
 
 
