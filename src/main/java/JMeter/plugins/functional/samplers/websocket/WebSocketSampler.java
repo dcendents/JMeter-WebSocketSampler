@@ -36,6 +36,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -46,6 +47,9 @@ import java.util.concurrent.TimeUnit;
  * @author Maciej Zaleski
  */
 public class WebSocketSampler extends AbstractSampler implements TestStateListener {
+	
+	private static final Object LOCK = new Object();
+	
     public static int DEFAULT_CONNECTION_TIMEOUT = 20000; //20 sec
     public static int DEFAULT_RESPONSE_TIMEOUT = 20000; //20 sec
     public static int MESSAGE_BACKLOG_COUNT = 3;
@@ -72,60 +76,63 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     private ServiceSocket getConnectionSocket() throws URISyntaxException, Exception {
         URI uri = getUri();
 
-        String connectionId = getThreadName() + getConnectionId();
-        
-        if (isStreamingConnection() && connectionList.containsKey(connectionId)) {
-            ServiceSocket socket = connectionList.get(connectionId);
-            if (!isResetStreamingConnection()) {
-                socket.initialize();
-                return socket;
-            } else {
-                connectionList.remove(connectionId);
-                socket.close();
-            }
-        }
-        
-        //Create WebSocket client
-        SslContextFactory sslContexFactory = new SslContextFactory();
-        sslContexFactory.setTrustAll(isIgnoreSslErrors());
-//        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
-        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
-        
-        ServiceSocket socket = new ServiceSocket(this, webSocketClient);
-        if (isStreamingConnection()) {
-            connectionList.put(connectionId, socket);
-        }
+        String connectionId = getConnectionId();
 
-        //Start WebSocket client thread and upgrage HTTP connection
-        webSocketClient.start();
-        ClientUpgradeRequest request = new ClientUpgradeRequest();
-        if (headerManager != null) {
-            for (int i = 0; i < headerManager.size(); i++) {
-                Header header = headerManager.get(i);
-                request.setHeader(header.getName(), header.getValue());
-            }
-        }
+        synchronized (LOCK) {
+        	if (isStreamingConnection() && connectionList.containsKey(connectionId)) {
+        		ServiceSocket socket = connectionList.get(connectionId);
+        		if (!isResetStreamingConnection()) {
+        			CountDownLatch latch = getResponseTimeoutIntValue() > 0 ? new CountDownLatch(1) : null;
+        			socket.initialize(latch);
+        			return socket;
+        		} else {
+        			connectionList.remove(connectionId);
+        			socket.close();
+        		}
+        	}
 
-        webSocketClient.connect(socket, uri, request);
-        
-        //Get connection timeout or use the default value
-        int connectionTimeout;
-        try {
-            connectionTimeout = Integer.parseInt(getConnectionTimeout());
-        } catch (NumberFormatException ex) {
-            log.warn("Connection timeout is not a number; using the default connection timeout of " + DEFAULT_CONNECTION_TIMEOUT + "ms");
-            connectionTimeout = DEFAULT_CONNECTION_TIMEOUT;
+        	//Create WebSocket client
+        	SslContextFactory sslContexFactory = new SslContextFactory();
+        	sslContexFactory.setTrustAll(isIgnoreSslErrors());
+        	//        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
+        	WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
+
+        	ServiceSocket socket = new ServiceSocket(this, webSocketClient);
+        	if (isStreamingConnection()) {
+        		connectionList.put(connectionId, socket);
+        	}
+
+        	//Start WebSocket client thread and upgrade HTTP connection
+        	webSocketClient.start();
+        	ClientUpgradeRequest request = new ClientUpgradeRequest();
+        	if (headerManager != null) {
+        		for (int i = 0; i < headerManager.size(); i++) {
+        			Header header = headerManager.get(i);
+        			request.setHeader(header.getName(), header.getValue());
+        		}
+        	}
+
+        	webSocketClient.connect(socket, uri, request);
+
+        	//Get connection timeout or use the default value
+        	int connectionTimeout;
+        	try {
+        		connectionTimeout = Integer.parseInt(getConnectionTimeout());
+        	} catch (NumberFormatException ex) {
+        		log.warn("Connection timeout is not a number; using the default connection timeout of " + DEFAULT_CONNECTION_TIMEOUT + "ms");
+        		connectionTimeout = DEFAULT_CONNECTION_TIMEOUT;
+        	}
+
+        	socket.awaitOpen(connectionTimeout, TimeUnit.MILLISECONDS);
+
+        	return socket;
         }
-        
-        socket.awaitOpen(connectionTimeout, TimeUnit.MILLISECONDS);
-        
-        return socket;
     }
     
     @Override
     public SampleResult sample(Entry entry) {
         ServiceSocket socket = null;
-        SampleResult sampleResult = new SampleResult();
+        WebSocketSampleResult sampleResult = new WebSocketSampleResult();
         sampleResult.setSampleLabel(getName());
         sampleResult.setDataEncoding(getContentEncoding());
         
@@ -159,36 +166,38 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
                 socket.sendMessage(payloadMessage);
             }
 
-            int responseTimeout;
-            try {
-                responseTimeout = Integer.parseInt(getResponseTimeout());
-            } catch (NumberFormatException ex) {
-                log.warn("Request timeout is not a number; using the default request timeout of " + DEFAULT_RESPONSE_TIMEOUT + "ms");
-                responseTimeout = DEFAULT_RESPONSE_TIMEOUT;
-            }
+            int responseTimeout = getResponseTimeoutIntValue();
             
-            //Wait for any of the following:
-            // - Response matching response pattern is received
-            // - Response matching connection closing pattern is received
-            // - Timeout is reached
-            socket.awaitClose(responseTimeout, TimeUnit.MILLISECONDS);
-            
-            //If no response is received set code 204; actually not used...needs to do something else
-            if (socket.getResponseMessage() == null || socket.getResponseMessage().isEmpty()) {
-                sampleResult.setResponseCode("204");
-            }
-            
-            //Set sampler response code
-            if (socket.getError() != 0) {
-                isOK = false;
-                sampleResult.setResponseCode(socket.getError().toString());
+            if( responseTimeout > 0 ) {
+            	//Wait for any of the following:
+            	// - Response matching response pattern is received
+            	// - Response matching connection closing pattern is received
+            	// - Timeout is reached
+            	socket.awaitClose(responseTimeout, TimeUnit.MILLISECONDS);
+
+            	//If no response is received set code 204; actually not used...needs to do something else
+            	if (socket.getResponseMessage() == null || socket.getResponseMessage().isEmpty()) {
+            		sampleResult.setResponseCode("204");
+            	}
+
+            	//Set sampler response code
+            	if (socket.getError() != 0) {
+            		isOK = false;
+            		sampleResult.setResponseCode(socket.getError().toString());
+            	} else {
+            		sampleResult.setResponseCodeOK();
+            		isOK = true;
+            	}
+
+            	//set sampler response
+            	sampleResult.setResponseData(socket.getResponseMessage(), getContentEncoding());
+
+            	sampleResult.setMessageCounter(socket.messageCounter);
+            	sampleResult.setResponeBacklog(socket.responeBacklog);
             } else {
-                sampleResult.setResponseCodeOK();
-                isOK = true;
+            	sampleResult.setResponseCodeOK();
+            	isOK = true;
             }
-            
-            //set sampler response
-            sampleResult.setResponseData(socket.getResponseMessage(), getContentEncoding());
             
         } catch (URISyntaxException e) {
             errorList.append(" - Invalid URI syntax: ").append(e.getMessage()).append("\n").append(StringUtils.join(e.getStackTrace(), "\n")).append("\n");
@@ -250,7 +259,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         if (isProtocolDefaultPort()) {
             return new URI(protocol, null, domain, -1, path, queryString, null);
         }
-        return new URI(protocol, null, domain, Integer.parseInt(getServerPort()), path, queryString, null);
+        return new URI(protocol, null, domain, getServerPortIntValue(), path, queryString, null);
     }
 
     /**
@@ -260,14 +269,14 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
      * otherwise
      */
     public boolean isProtocolDefaultPort() {
-        final int port = Integer.parseInt(getServerPort());
+        final int port = getServerPortIntValue();
         final String protocol = getProtocol();
         return ("ws".equalsIgnoreCase(protocol) && port == HTTPConstants.DEFAULT_HTTP_PORT)
                 || ("wss".equalsIgnoreCase(protocol) && port == HTTPConstants.DEFAULT_HTTPS_PORT);
     }
 
-    public String getServerPort() {
-        final String port_s = getPropertyAsString("serverPort", "0");
+    public int getServerPortIntValue() {
+        final String port_s = getServerPort();
         Integer port;
         String protocol = getProtocol();
         
@@ -279,12 +288,16 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         
         if (port == 0) {
             if ("wss".equalsIgnoreCase(protocol)) {
-                return String.valueOf(HTTPConstants.DEFAULT_HTTPS_PORT);
+                return HTTPConstants.DEFAULT_HTTPS_PORT;
             } else if ("ws".equalsIgnoreCase(protocol)) {
-                return String.valueOf(HTTPConstants.DEFAULT_HTTP_PORT);
+                return HTTPConstants.DEFAULT_HTTP_PORT;
             }
         }
-        return port.toString();
+        return port;
+    }
+
+    public String getServerPort() {
+        return getPropertyAsString("serverPort", "0");
     }
     
     public void setServerPort(String port) {
@@ -293,6 +306,15 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     
     public String getResponseTimeout() {
         return getPropertyAsString("responseTimeout", "20000");
+    }    
+    
+    public int getResponseTimeoutIntValue() {
+        try {
+            return Integer.parseInt(getResponseTimeout());
+        } catch (NumberFormatException ex) {
+            log.warn("Request timeout is not a number; using the default request timeout of " + DEFAULT_RESPONSE_TIMEOUT + "ms");
+            return DEFAULT_RESPONSE_TIMEOUT;
+        }
     }    
     
     public void setResponseTimeout(String responseTimeout) {
@@ -447,6 +469,22 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
 
     public String getMessageBacklog() {
             return getPropertyAsString("messageBacklog", "3");
+    }
+
+    public void setResponseCount(String responseCount) {
+            setProperty("responseCount", responseCount);
+    }
+
+    public String getResponseCount() {
+            return getPropertyAsString("responseCount");
+    }
+
+    public int getResponseCountIntValue() {
+        try {
+            return Integer.parseInt(getResponseCount());
+        } catch (Exception ex) {
+            return -1;
+        }
     }
 
     
