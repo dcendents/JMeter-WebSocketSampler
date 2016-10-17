@@ -34,7 +34,6 @@ public class ServiceSocket {
 
 	private Object lock = new Object();
 	
-    protected WebSocketSampler parent;
     protected WebSocketClient client;
     private static final Logger log = LoggingManager.getLoggerForClass();
     protected Integer error = 0;
@@ -46,15 +45,16 @@ public class ServiceSocket {
     protected String disconnectPattern;
     protected int messageCounter = 0;
     protected int wantedResponses = -1;
+    protected int messageBacklogSize;
     protected Pattern responseExpression;
     protected Pattern disconnectExpression;
+    protected boolean streamingConnection = false;
     protected boolean connected = false;
     
     protected Deque<String> responeBacklog = new LinkedBlockingDeque<>();
 
 
     public ServiceSocket(WebSocketSampler parent, WebSocketClient client) {
-        this.parent = parent;
         this.client = client;
         
         //Evaluate response matching patterns in case thay contain JMeter variables (i.e. ${var})
@@ -62,6 +62,14 @@ public class ServiceSocket {
         disconnectPattern = new CompoundVariable(parent.getCloseConncectionPattern()).execute();
         wantedResponses = parent.getResponseCountIntValue();
 
+        streamingConnection = parent.isStreamingConnection();
+        try {
+        	messageBacklogSize = Integer.parseInt(parent.getMessageBacklog());
+        } catch (Exception ex) {
+            logMessage.append(" - Message backlog value not set; using default ").append(WebSocketSampler.MESSAGE_BACKLOG_COUNT).append("\n");
+            messageBacklogSize = WebSocketSampler.MESSAGE_BACKLOG_COUNT;
+        }
+        
         logMessage.append("\n\n[Execution Flow]\n");
         logMessage.append(" - Opening new connection\n");
         initializePatterns();
@@ -179,7 +187,7 @@ public class ServiceSocket {
         logMessage.append(" - Waiting for messages for ").append(duration).append(" ").append(unit.toString()).append("\n");
         boolean res = this.closeLatch.await(duration, unit);
 
-        if (!parent.isStreamingConnection()) {
+        if (!streamingConnection) {
             close(StatusCode.NORMAL, "JMeter closed session.");
         } else {
             logMessage.append(" - Leaving streaming connection open").append("\n");
@@ -248,6 +256,7 @@ public class ServiceSocket {
     public String getLogMessage() {
         logMessage.append("\n\n[Variables]\n");
         logMessage.append(" - Message count: ").append(messageCounter).append("\n");
+        logMessage.append(" - Message Backlog: ").append(responeBacklog.size()).append("\n");
 
         return logMessage.toString();
     }
@@ -296,15 +305,7 @@ public class ServiceSocket {
     }
 
     private int addResponseMessage(String message) {
-        int messageBacklog;
-        try {
-            messageBacklog = Integer.parseInt(parent.getMessageBacklog());
-        } catch (Exception ex) {
-            logMessage.append(" - Message backlog value not set; using default ").append(WebSocketSampler.MESSAGE_BACKLOG_COUNT).append("\n");
-            messageBacklog = WebSocketSampler.MESSAGE_BACKLOG_COUNT;
-        }
-
-        while (responeBacklog.size() >= messageBacklog) {
+        while (responeBacklog.size() >= messageBacklogSize) {
             responeBacklog.poll();
         }
         responeBacklog.add(message);

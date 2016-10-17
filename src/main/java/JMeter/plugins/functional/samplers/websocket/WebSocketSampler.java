@@ -176,7 +176,8 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
             	socket.awaitClose(responseTimeout, TimeUnit.MILLISECONDS);
 
             	//If no response is received set code 204; actually not used...needs to do something else
-            	if (socket.getResponseMessage() == null || socket.getResponseMessage().isEmpty()) {
+            	String responseMessage = socket.getResponseMessage();
+            	if (StringUtils.isBlank(responseMessage)) {
             		sampleResult.setResponseCode("204");
             	}
 
@@ -190,7 +191,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
             	}
 
             	//set sampler response
-            	sampleResult.setResponseData(socket.getResponseMessage(), getContentEncoding());
+            	sampleResult.setResponseData(responseMessage, getContentEncoding());
 
             	sampleResult.setMessageCounter(socket.messageCounter);
             	sampleResult.setResponeBacklog(socket.responeBacklog);
